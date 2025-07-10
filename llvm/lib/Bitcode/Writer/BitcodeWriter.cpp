@@ -5567,6 +5567,479 @@ void BitcodeWriter::writeIndex(
   IndexWriter.write();
 }
 
+
+
+
+
+
+class NonOpaqueTypeModuleWriter : public ModuleBitcodeWriter {
+
+  public:
+    NonOpaqueTypeModuleWriter(const Module &M, StringTableBuilder &StrtabBuilder,
+                        BitstreamWriter &Stream,
+                        const ModuleSummaryIndex &Index,
+                        const ModuleHash &ModHash,
+                        DenseMap<const Value *, Type *> *NonOpaqueTypeMap)
+      : ModuleBitcodeWriter(M, StrtabBuilder, Stream,
+                            ShouldPreserveUseListOrder, &Index,
+                            GenerateHash, ModHash),
+        NonOpaqueTypeMap(NonOpaqueTypeMap) {}
+
+  void write();
+
+
+
+  private:
+  DenseMap<const Value *, Type *> *NonOpaqueTypeMap;
+  void writeTypeTable();
+  void writeFunction(const Function &F, DenseMap<const Function *, uint64_t> &FunctionToBitcodeIndex);
+  void writeInstruction(const Instruction &I, DenseMap<const Function *, uint64_t> &FunctionToBitcodeIndex);
+};
+
+
+void NonOpaqueTypeModuleWriter::writeTypeTable() {
+  const ValueEnumerator::TypeList &TypeList = VE.getTypes();
+
+  Stream.EnterSubblock(bitc::TYPE_BLOCK_ID_NEW, 4 /*count from # abbrevs */);
+  SmallVector<uint64_t, 64> TypeVals;
+
+  uint64_t NumBits = VE.computeBitsRequiredForTypeIndices();
+
+
+  // Abbrev for TYPE_CODE_POINTER.
+  auto Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::TYPE_CODE_POINTER));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, NumBits));
+  Abbv->Add(BitCodeAbbrevOp(0)); // Addrspace = 0
+  unsigned PtrAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+
+  // Abbrev for TYPE_CODE_FUNCTION.
+  Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::TYPE_CODE_FUNCTION));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1));  // isvararg
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, NumBits));
+  unsigned FunctionAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+
+  // Abbrev for TYPE_CODE_STRUCT_ANON.
+  Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::TYPE_CODE_STRUCT_ANON));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1));  // ispacked
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, NumBits));
+  unsigned StructAnonAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+
+  // Abbrev for TYPE_CODE_STRUCT_NAME.
+  Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::TYPE_CODE_STRUCT_NAME));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Char6));
+  unsigned StructNameAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+
+  // Abbrev for TYPE_CODE_STRUCT_NAMED.
+  Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::TYPE_CODE_STRUCT_NAMED));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1));  // ispacked
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, NumBits));
+  unsigned StructNamedAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+
+  // Abbrev for TYPE_CODE_ARRAY.
+  Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::TYPE_CODE_ARRAY));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 8));   // size
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, NumBits));
+  unsigned ArrayAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+
+  // Emit an entry count so the reader can reserve space.
+  TypeVals.push_back(TypeList.size());
+  Stream.EmitRecord(bitc::TYPE_CODE_NUMENTRY, TypeVals);
+  TypeVals.clear();
+
+  // Loop over all of the types, emitting each in turn.
+  for (Type *T : TypeList) {
+    int AbbrevToUse = 0;
+    unsigned Code = 0;
+
+    switch (T->getTypeID()) {
+    case Type::VoidTyID:      Code = bitc::TYPE_CODE_VOID;      break;
+    case Type::HalfTyID:      Code = bitc::TYPE_CODE_HALF;      break;
+    case Type::BFloatTyID:    Code = bitc::TYPE_CODE_BFLOAT;    break;
+    case Type::FloatTyID:     Code = bitc::TYPE_CODE_FLOAT;     break;
+    case Type::DoubleTyID:    Code = bitc::TYPE_CODE_DOUBLE;    break;
+    case Type::X86_FP80TyID:  Code = bitc::TYPE_CODE_X86_FP80;  break;
+    case Type::FP128TyID:     Code = bitc::TYPE_CODE_FP128;     break;
+    case Type::PPC_FP128TyID: Code = bitc::TYPE_CODE_PPC_FP128; break;
+    case Type::LabelTyID:     Code = bitc::TYPE_CODE_LABEL;     break;
+    case Type::MetadataTyID:
+      Code = bitc::TYPE_CODE_METADATA;
+      break;
+    case Type::X86_AMXTyID:   Code = bitc::TYPE_CODE_X86_AMX;   break;
+    case Type::TokenTyID:     Code = bitc::TYPE_CODE_TOKEN;     break;
+    case Type::IntegerTyID:
+      // INTEGER: [width]
+      Code = bitc::TYPE_CODE_INTEGER;
+      TypeVals.push_back(cast<IntegerType>(T)->getBitWidth());
+      break;
+      case Type::TypedPointerTyID: {
+          TypedPointerType *PTy = cast<TypedPointerType>(T);
+          // POINTER: [pointee type, address space]
+          Code = bitc::TYPE_CODE_POINTER;
+          TypeVals.push_back(getTypeID(PTy->getElementType()));
+          unsigned AddressSpace = PTy->getAddressSpace();
+          TypeVals.push_back(AddressSpace);
+          if (AddressSpace == 0)
+            AbbrevToUse = PtrAbbrev;
+          break;
+        }
+    case Type::PointerTyID: {
+      PointerType *PTy = cast<PointerType>(T);
+      Code = bitc::TYPE_CODE_POINTER;
+      // opaque pointers are unsupported, so emit using an opaque element type
+      auto ET = StructType::get(PTy->getContext());
+      TypeVals.push_back(VE.getTypeID(ET));
+      TypeVals.push_back(AddressSpace);
+      if (AddressSpace == 0)
+        AbbrevToUse = PtrAbbrev;
+      break;
+    }
+    case Type::FunctionTyID: {
+      FunctionType *FT = cast<FunctionType>(T);
+      // FUNCTION: [isvararg, retty, paramty x N]
+      Code = bitc::TYPE_CODE_FUNCTION;
+      TypeVals.push_back(FT->isVarArg());
+      TypeVals.push_back(VE.getTypeID(FT->getReturnType()));
+      for (unsigned i = 0, e = FT->getNumParams(); i != e; ++i)
+        TypeVals.push_back(VE.getTypeID(FT->getParamType(i)));
+      AbbrevToUse = FunctionAbbrev;
+      break;
+    }
+    case Type::StructTyID: {
+      StructType *ST = cast<StructType>(T);
+      // STRUCT: [ispacked, eltty x N]
+      TypeVals.push_back(ST->isPacked());
+      // Output all of the element types.
+      for (Type *ET : ST->elements())
+        TypeVals.push_back(VE.getTypeID(ET));
+
+      if (ST->isLiteral()) {
+        Code = bitc::TYPE_CODE_STRUCT_ANON;
+        AbbrevToUse = StructAnonAbbrev;
+      } else {
+        if (ST->isOpaque()) {
+          Code = bitc::TYPE_CODE_OPAQUE;
+        } else {
+          Code = bitc::TYPE_CODE_STRUCT_NAMED;
+          AbbrevToUse = StructNamedAbbrev;
+        }
+
+        // Emit the name if it is present.
+        if (!ST->getName().empty())
+          writeStringRecord(Stream, bitc::TYPE_CODE_STRUCT_NAME, ST->getName(),
+                            StructNameAbbrev);
+      }
+      break;
+    }
+    case Type::ArrayTyID: {
+      ArrayType *AT = cast<ArrayType>(T);
+      // ARRAY: [numelts, eltty]
+      Code = bitc::TYPE_CODE_ARRAY;
+      TypeVals.push_back(AT->getNumElements());
+      TypeVals.push_back(VE.getTypeID(AT->getElementType()));
+      AbbrevToUse = ArrayAbbrev;
+      break;
+    }
+    case Type::FixedVectorTyID:
+    case Type::ScalableVectorTyID: {
+      VectorType *VT = cast<VectorType>(T);
+      // VECTOR [numelts, eltty] or
+      //        [numelts, eltty, scalable]
+      Code = bitc::TYPE_CODE_VECTOR;
+      TypeVals.push_back(VT->getElementCount().getKnownMinValue());
+      TypeVals.push_back(VE.getTypeID(VT->getElementType()));
+      if (isa<ScalableVectorType>(VT))
+        TypeVals.push_back(true);
+      break;
+    }
+    case Type::TargetExtTyID: {
+      TargetExtType *TET = cast<TargetExtType>(T);
+      Code = bitc::TYPE_CODE_TARGET_TYPE;
+      writeStringRecord(Stream, bitc::TYPE_CODE_STRUCT_NAME, TET->getName(),
+                        StructNameAbbrev);
+      TypeVals.push_back(TET->getNumTypeParameters());
+      for (Type *InnerTy : TET->type_params())
+        TypeVals.push_back(VE.getTypeID(InnerTy));
+      llvm::append_range(TypeVals, TET->int_params());
+      break;
+    }
+
+    }
+
+    // Emit the finished record.
+    Stream.EmitRecord(Code, TypeVals, AbbrevToUse);
+    TypeVals.clear();
+  }
+
+  Stream.ExitBlock();
+
+
+}
+
+
+void NonOpaqueTypeModuleWriter::writeFunction(const Function &F, DenseMap<const Function *, uint64_t> &FunctionToBitcodeIndex) {
+// Save the bitcode index of the start of this function block for recording
+// in the VST.
+FunctionToBitcodeIndex[&F] = Stream.GetCurrentBitNo();
+
+Stream.EnterSubblock(bitc::FUNCTION_BLOCK_ID, 5);
+VE.incorporateFunction(F);
+
+SmallVector<unsigned, 64> Vals;
+
+// Emit the number of basic blocks, so the reader can create them ahead of
+// time.
+Vals.push_back(VE.getBasicBlocks().size());
+Stream.EmitRecord(bitc::FUNC_CODE_DECLAREBLOCKS, Vals);
+Vals.clear();
+
+// If there are function-local constants, emit them now.
+unsigned CstStart, CstEnd;
+VE.getFunctionConstantRange(CstStart, CstEnd);
+writeConstants(CstStart, CstEnd, false);
+
+// If there is function-local metadata, emit it now.
+writeFunctionMetadata(F);
+
+// Keep a running idea of what the instruction ID is.
+unsigned InstID = CstEnd;
+
+bool NeedsMetadataAttachment = F.hasMetadata();
+
+DILocation *LastDL = nullptr;
+SmallSetVector<Function *, 4> BlockAddressUsers;
+
+// Finally, emit all the instructions, in order.
+for (const BasicBlock &BB : F) {
+for (const Instruction &I : BB) {
+  writeInstruction(I, InstID, Vals);
+
+  if (!I.getType()->isVoidTy())
+    ++InstID;
+
+  // If the instruction has metadata, write a metadata attachment later.
+  NeedsMetadataAttachment |= I.hasMetadataOtherThanDebugLoc();
+
+  // If the instruction has a debug location, emit it.
+  if (DILocation *DL = I.getDebugLoc()) {
+    if (DL == LastDL) {
+      // Just repeat the same debug loc as last time.
+      Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_LOC_AGAIN, Vals);
+    } else {
+      Vals.push_back(DL->getLine());
+      Vals.push_back(DL->getColumn());
+      Vals.push_back(VE.getMetadataOrNullID(DL->getScope()));
+      Vals.push_back(VE.getMetadataOrNullID(DL->getInlinedAt()));
+      Vals.push_back(DL->isImplicitCode());
+      Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_LOC, Vals);
+      Vals.clear();
+      LastDL = DL;
+    }
+  }
+
+  // If the instruction has DbgRecords attached to it, emit them. Note that
+  // they come after the instruction so that it's easy to attach them again
+  // when reading the bitcode, even though conceptually the debug locations
+  // start "before" the instruction.
+  if (I.hasDbgRecords()) {
+    /// Try to push the value only (unwrapped), otherwise push the
+    /// metadata wrapped value. Returns true if the value was pushed
+    /// without the ValueAsMetadata wrapper.
+    auto PushValueOrMetadata = [&Vals, InstID,
+                                this](Metadata *RawLocation) {
+      assert(RawLocation &&
+             "RawLocation unexpectedly null in DbgVariableRecord");
+      if (ValueAsMetadata *VAM = dyn_cast<ValueAsMetadata>(RawLocation)) {
+        SmallVector<unsigned, 2> ValAndType;
+        // If the value is a fwd-ref the type is also pushed. We don't
+        // want the type, so fwd-refs are kept wrapped (pushValueAndType
+        // returns false if the value is pushed without type).
+        if (!pushValueAndType(VAM->getValue(), InstID, ValAndType)) {
+          Vals.push_back(ValAndType[0]);
+          return true;
+        }
+      }
+      // The metadata is a DIArgList, or ValueAsMetadata wrapping a
+      // fwd-ref. Push the metadata ID.
+      Vals.push_back(VE.getMetadataID(RawLocation));
+      return false;
+    };
+
+    // Write out non-instruction debug information attached to this
+    // instruction. Write it after the instruction so that it's easy to
+    // re-attach to the instruction reading the records in.
+    for (DbgRecord &DR : I.DebugMarker->getDbgRecordRange()) {
+      if (DbgLabelRecord *DLR = dyn_cast<DbgLabelRecord>(&DR)) {
+        Vals.push_back(VE.getMetadataID(&*DLR->getDebugLoc()));
+        Vals.push_back(VE.getMetadataID(DLR->getLabel()));
+        Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_RECORD_LABEL, Vals);
+        Vals.clear();
+        continue;
+      }
+
+      // First 3 fields are common to all kinds:
+      //   DILocation, DILocalVariable, DIExpression
+      // dbg_value (FUNC_CODE_DEBUG_RECORD_VALUE)
+      //   ..., LocationMetadata
+      // dbg_value (FUNC_CODE_DEBUG_RECORD_VALUE_SIMPLE - abbrev'd)
+      //   ..., Value
+      // dbg_declare (FUNC_CODE_DEBUG_RECORD_DECLARE)
+      //   ..., LocationMetadata
+      // dbg_assign (FUNC_CODE_DEBUG_RECORD_ASSIGN)
+      //   ..., LocationMetadata, DIAssignID, DIExpression, LocationMetadata
+      DbgVariableRecord &DVR = cast<DbgVariableRecord>(DR);
+      Vals.push_back(VE.getMetadataID(&*DVR.getDebugLoc()));
+      Vals.push_back(VE.getMetadataID(DVR.getVariable()));
+      Vals.push_back(VE.getMetadataID(DVR.getExpression()));
+      if (DVR.isDbgValue()) {
+        if (PushValueOrMetadata(DVR.getRawLocation()))
+          Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_RECORD_VALUE_SIMPLE, Vals,
+                            FUNCTION_DEBUG_RECORD_VALUE_ABBREV);
+        else
+          Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_RECORD_VALUE, Vals);
+      } else if (DVR.isDbgDeclare()) {
+        Vals.push_back(VE.getMetadataID(DVR.getRawLocation()));
+        Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_RECORD_DECLARE, Vals);
+      } else {
+        assert(DVR.isDbgAssign() && "Unexpected DbgRecord kind");
+        Vals.push_back(VE.getMetadataID(DVR.getRawLocation()));
+        Vals.push_back(VE.getMetadataID(DVR.getAssignID()));
+        Vals.push_back(VE.getMetadataID(DVR.getAddressExpression()));
+        Vals.push_back(VE.getMetadataID(DVR.getRawAddress()));
+        Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_RECORD_ASSIGN, Vals);
+      }
+      Vals.clear();
+    }
+  }
+}
+
+if (BlockAddress *BA = BlockAddress::lookup(&BB)) {
+  SmallVector<Value *> Worklist{BA};
+  SmallPtrSet<Value *, 8> Visited{BA};
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    for (User *U : V->users()) {
+      if (auto *I = dyn_cast<Instruction>(U)) {
+        Function *P = I->getFunction();
+        if (P != &F)
+          BlockAddressUsers.insert(P);
+      } else if (isa<Constant>(U) && !isa<GlobalValue>(U) &&
+                 Visited.insert(U).second)
+        Worklist.push_back(U);
+    }
+  }
+}
+}
+
+if (!BlockAddressUsers.empty()) {
+Vals.resize(BlockAddressUsers.size());
+for (auto I : llvm::enumerate(BlockAddressUsers))
+  Vals[I.index()] = VE.getValueID(I.value());
+Stream.EmitRecord(bitc::FUNC_CODE_BLOCKADDR_USERS, Vals);
+Vals.clear();
+}
+
+// Emit names for all the instructions etc.
+if (auto *Symtab = F.getValueSymbolTable())
+writeFunctionLevelValueSymbolTable(*Symtab);
+
+if (NeedsMetadataAttachment)
+writeFunctionMetadataAttachment(F);
+if (VE.shouldPreserveUseListOrder())
+writeUseListBlock(&F);
+VE.purgeFunction();
+Stream.ExitBlock();
+}
+
+
+void NonOpaqueTypeModuleWriter::write() {
+  writeIdentificationBlock(Stream);
+
+  Stream.EnterSubblock(bitc::MODULE_BLOCK_ID, 3);
+  // We will want to write the module hash at this point. Block any flushing so
+  // we can have access to the whole underlying data later.
+  Stream.markAndBlockFlushing();
+
+  writeModuleVersion();
+
+  // Emit blockinfo, which defines the standard abbreviations etc.
+  writeBlockInfo();
+
+  // Emit information describing all of the types in the module.
+  NonOpaqueTypeModuleWriter::writeTypeTable();
+
+  // Emit information about attribute groups.
+  writeAttributeGroupTable();
+
+  // Emit information about parameter attributes.
+  writeAttributeTable();
+
+  writeComdats();
+
+  // Emit top-level description of module, including target triple, inline asm,
+  // descriptors for global variables, and function prototype info.
+  writeModuleInfo();
+
+  // Emit constants.
+  writeModuleConstants();
+
+  // Emit metadata kind names.
+  writeModuleMetadataKinds();
+
+  // Emit metadata.
+  writeModuleMetadata();
+
+  // Emit module-level use-lists.
+  if (VE.shouldPreserveUseListOrder())
+    writeUseListBlock(nullptr);
+
+  writeOperandBundleTags();
+  writeSyncScopeNames();
+
+  // Emit function bodies.
+  DenseMap<const Function *, uint64_t> FunctionToBitcodeIndex;
+  for (const Function &F : M)
+    if (!F.isDeclaration())
+      writeFunction(F, FunctionToBitcodeIndex);
+
+  // Need to write after the above call to WriteFunction which populates
+  // the summary information in the index.
+  if (Index)
+    writePerModuleGlobalValueSummary();
+
+  writeGlobalValueSymbolTable(FunctionToBitcodeIndex);
+
+  writeModuleHash(Stream.getMarkedBufferAndResumeFlushing());
+
+  Stream.ExitBlock();
+}
+
+
+void BitcodeWriter::writeBitcodeWithNonOpaqueTypes(const Module &M,
+                                                   bool ShouldPreserveUseListOrder,
+                                                   const ModuleSummaryIndex *Index,
+                                                   bool GenerateHash,
+                                                   ModuleHash *ModHash,
+                                                   bool WriteNonOpaqueTypes,
+                                                   DenseMap<const Value *, Type *> *NonOpaqueTypeMap) {
+  assert(!WroteStrtab);
+
+  assert(M.isMaterialized());
+  Mods.push_back(const_cast<Module *>(&M));
+  NonOpaqueTypeModuleWriter NonOpaqueTypeModuleWriter(M, StrtabBuilder, *Stream,
+                                          *Index, *ModHash, NonOpaqueTypeMap);
+  NonOpaqueTypeModuleWriter.write();
+}
+
 /// Write the specified module to the specified output stream.
 void llvm::WriteBitcodeToFile(const Module &M, raw_ostream &Out,
                               bool ShouldPreserveUseListOrder,
