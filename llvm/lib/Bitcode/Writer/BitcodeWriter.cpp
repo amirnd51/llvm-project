@@ -5688,7 +5688,7 @@ void NonOpaqueTypeModuleWriter::writeTypeTable() {
           TypedPointerType *PTy = cast<TypedPointerType>(T);
           // POINTER: [pointee type, address space]
           Code = bitc::TYPE_CODE_POINTER;
-          TypeVals.push_back(getTypeID(PTy->getElementType()));
+          TypeVals.push_back(VE.getTypeID(PTy->getElementType()));
           unsigned AddressSpace = PTy->getAddressSpace();
           TypeVals.push_back(AddressSpace);
           if (AddressSpace == 0)
@@ -5964,6 +5964,509 @@ VE.purgeFunction();
 Stream.ExitBlock();
 }
 
+void NonOpaqueTypeModuleWriter::writeInstruction(const Instruction &I,
+                                                 unsigned InstID,
+                                                 SmallVectorImpl<unsigned> &Vals) {
+  unsigned Code = 0;
+  unsigned AbbrevToUse = 0;
+  VE.setInstructionID(&I);
+  switch (I.getOpcode()) {
+  default:
+    if (Instruction::isCast(I.getOpcode())) {
+      Code = bitc::FUNC_CODE_INST_CAST;
+      if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+        AbbrevToUse = FUNCTION_INST_CAST_ABBREV;
+      // Use NonOpaqueTypeMap for pointer types if available
+      Type *DestType = I.getType();
+      if (NonOpaqueTypeMap && NonOpaqueTypeMap->count(&I)) {
+        DestType = (*NonOpaqueTypeMap)[&I];
+      }
+      Vals.push_back(VE.getTypeID(DestType));
+      Vals.push_back(getEncodedCastOpcode(I.getOpcode()));
+      uint64_t Flags = getOptimizationFlags(&I);
+      if (Flags != 0) {
+        if (AbbrevToUse == FUNCTION_INST_CAST_ABBREV)
+          AbbrevToUse = FUNCTION_INST_CAST_FLAGS_ABBREV;
+        Vals.push_back(Flags);
+      }
+    } else {
+      assert(isa<BinaryOperator>(I) && "Unknown instruction!");
+      Code = bitc::FUNC_CODE_INST_BINOP;
+      if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+        AbbrevToUse = FUNCTION_INST_BINOP_ABBREV;
+      pushValue(I.getOperand(1), InstID, Vals);
+      Vals.push_back(getEncodedBinaryOpcode(I.getOpcode()));
+      uint64_t Flags = getOptimizationFlags(&I);
+      if (Flags != 0) {
+        if (AbbrevToUse == FUNCTION_INST_BINOP_ABBREV)
+          AbbrevToUse = FUNCTION_INST_BINOP_FLAGS_ABBREV;
+        Vals.push_back(Flags);
+      }
+    }
+    break;
+  case Instruction::FNeg: {
+    Code = bitc::FUNC_CODE_INST_UNOP;
+    if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+      AbbrevToUse = FUNCTION_INST_UNOP_ABBREV;
+    Vals.push_back(getEncodedUnaryOpcode(I.getOpcode()));
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0) {
+      if (AbbrevToUse == FUNCTION_INST_UNOP_ABBREV)
+        AbbrevToUse = FUNCTION_INST_UNOP_FLAGS_ABBREV;
+      Vals.push_back(Flags);
+    }
+    break;
+  }
+  case Instruction::GetElementPtr: {
+    Code = bitc::FUNC_CODE_INST_GEP;
+    AbbrevToUse = FUNCTION_INST_GEP_ABBREV;
+    auto &GEPInst = cast<GetElementPtrInst>(I);
+    Vals.push_back(getOptimizationFlags(&I));
+    Vals.push_back(VE.getTypeID(GEPInst.getSourceElementType()));
+    for (const Value *Op : I.operands())
+      pushValueAndType(Op, InstID, Vals);
+    break;
+  }
+  case Instruction::ExtractValue: {
+    Code = bitc::FUNC_CODE_INST_EXTRACTVAL;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    const ExtractValueInst *EVI = cast<ExtractValueInst>(&I);
+    Vals.append(EVI->idx_begin(), EVI->idx_end());
+    break;
+  }
+  case Instruction::InsertValue: {
+    Code = bitc::FUNC_CODE_INST_INSERTVAL;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(I.getOperand(1), InstID, Vals);
+    const InsertValueInst *IVI = cast<InsertValueInst>(&I);
+    Vals.append(IVI->idx_begin(), IVI->idx_end());
+    break;
+  }
+  case Instruction::Select: {
+    Code = bitc::FUNC_CODE_INST_VSELECT;
+    pushValueAndType(I.getOperand(1), InstID, Vals);
+    pushValue(I.getOperand(2), InstID, Vals);
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0)
+      Vals.push_back(Flags);
+    break;
+  }
+  case Instruction::ExtractElement:
+    Code = bitc::FUNC_CODE_INST_EXTRACTELT;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(I.getOperand(1), InstID, Vals);
+    break;
+  case Instruction::InsertElement:
+    Code = bitc::FUNC_CODE_INST_INSERTELT;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValue(I.getOperand(1), InstID, Vals);
+    pushValueAndType(I.getOperand(2), InstID, Vals);
+    break;
+  case Instruction::ShuffleVector:
+    Code = bitc::FUNC_CODE_INST_SHUFFLEVEC;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValue(I.getOperand(1), InstID, Vals);
+    pushValue(cast<ShuffleVectorInst>(I).getShuffleMaskForBitcode(), InstID,
+              Vals);
+    break;
+  case Instruction::ICmp:
+  case Instruction::FCmp: {
+    // compare returning Int1Ty or vector of Int1Ty
+    Code = bitc::FUNC_CODE_INST_CMP2;
+    AbbrevToUse = FUNCTION_INST_CMP_ABBREV;
+    if (pushValueAndType(I.getOperand(0), InstID, Vals))
+      AbbrevToUse = 0;
+    pushValue(I.getOperand(1), InstID, Vals);
+    Vals.push_back(cast<CmpInst>(I).getPredicate());
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0) {
+      Vals.push_back(Flags);
+      if (AbbrevToUse)
+        AbbrevToUse = FUNCTION_INST_CMP_FLAGS_ABBREV;
+    }
+    break;
+  }
+
+  case Instruction::Ret:
+    {
+      Code = bitc::FUNC_CODE_INST_RET;
+      unsigned NumOperands = I.getNumOperands();
+      if (NumOperands == 0)
+        AbbrevToUse = FUNCTION_INST_RET_VOID_ABBREV;
+      else if (NumOperands == 1) {
+        if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+          AbbrevToUse = FUNCTION_INST_RET_VAL_ABBREV;
+      } else {
+        for (const Value *Op : I.operands())
+          pushValueAndType(Op, InstID, Vals);
+      }
+    }
+    break;
+  case Instruction::Br:
+    {
+      Code = bitc::FUNC_CODE_INST_BR;
+      AbbrevToUse = FUNCTION_INST_BR_UNCOND_ABBREV;
+      const BranchInst &II = cast<BranchInst>(I);
+      Vals.push_back(VE.getValueID(II.getSuccessor(0)));
+      if (II.isConditional()) {
+        Vals.push_back(VE.getValueID(II.getSuccessor(1)));
+        pushValue(II.getCondition(), InstID, Vals);
+        AbbrevToUse = FUNCTION_INST_BR_COND_ABBREV;
+      }
+    }
+    break;
+  case Instruction::Switch:
+    {
+      Code = bitc::FUNC_CODE_INST_SWITCH;
+      const SwitchInst &SI = cast<SwitchInst>(I);
+      Vals.push_back(VE.getTypeID(SI.getCondition()->getType()));
+      pushValue(SI.getCondition(), InstID, Vals);
+      Vals.push_back(VE.getValueID(SI.getDefaultDest()));
+      for (auto Case : SI.cases()) {
+        Vals.push_back(VE.getValueID(Case.getCaseValue()));
+        Vals.push_back(VE.getValueID(Case.getCaseSuccessor()));
+      }
+    }
+    break;
+  case Instruction::IndirectBr:
+    Code = bitc::FUNC_CODE_INST_INDIRECTBR;
+    // Use NonOpaqueTypeMap for operand type if available
+    if (NonOpaqueTypeMap && NonOpaqueTypeMap->count(I.getOperand(0))) {
+      Vals.push_back(VE.getTypeID((*NonOpaqueTypeMap)[I.getOperand(0)]));
+    } else {
+      Vals.push_back(VE.getTypeID(I.getOperand(0)->getType()));
+    }
+    // Encode the address operand as relative, but not the basic blocks.
+    pushValue(I.getOperand(0), InstID, Vals);
+    for (const Value *Op : drop_begin(I.operands()))
+      Vals.push_back(VE.getValueID(Op));
+    break;
+
+  case Instruction::Invoke: {
+    const InvokeInst *II = cast<InvokeInst>(&I);
+    const Value *Callee = II->getCalledOperand();
+    FunctionType *FTy = II->getFunctionType();
+
+    if (II->hasOperandBundles())
+      writeOperandBundles(*II, InstID);
+
+    Code = bitc::FUNC_CODE_INST_INVOKE;
+
+    Vals.push_back(VE.getAttributeListID(II->getAttributes()));
+    Vals.push_back(II->getCallingConv() | 1 << 13);
+    Vals.push_back(VE.getValueID(II->getNormalDest()));
+    Vals.push_back(VE.getValueID(II->getUnwindDest()));
+    Vals.push_back(VE.getTypeID(FTy));
+    pushValueAndType(Callee, InstID, Vals);
+
+    // Emit value #'s for the fixed parameters.
+    for (unsigned i = 0, e = FTy->getNumParams(); i != e; ++i)
+      pushValue(I.getOperand(i), InstID, Vals); // fixed param.
+
+    // Emit type/value pairs for varargs params.
+    if (FTy->isVarArg()) {
+      for (unsigned i = FTy->getNumParams(), e = II->arg_size(); i != e; ++i)
+        pushValueAndType(I.getOperand(i), InstID, Vals); // vararg
+    }
+    break;
+  }
+  case Instruction::Resume:
+    Code = bitc::FUNC_CODE_INST_RESUME;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    break;
+  case Instruction::CleanupRet: {
+    Code = bitc::FUNC_CODE_INST_CLEANUPRET;
+    const auto &CRI = cast<CleanupReturnInst>(I);
+    pushValue(CRI.getCleanupPad(), InstID, Vals);
+    if (CRI.hasUnwindDest())
+      Vals.push_back(VE.getValueID(CRI.getUnwindDest()));
+    break;
+  }
+  case Instruction::CatchRet: {
+    Code = bitc::FUNC_CODE_INST_CATCHRET;
+    const auto &CRI = cast<CatchReturnInst>(I);
+    pushValue(CRI.getCatchPad(), InstID, Vals);
+    Vals.push_back(VE.getValueID(CRI.getSuccessor()));
+    break;
+  }
+  case Instruction::CleanupPad:
+  case Instruction::CatchPad: {
+    const auto &FuncletPad = cast<FuncletPadInst>(I);
+    Code = isa<CatchPadInst>(FuncletPad) ? bitc::FUNC_CODE_INST_CATCHPAD
+                                         : bitc::FUNC_CODE_INST_CLEANUPPAD;
+    pushValue(FuncletPad.getParentPad(), InstID, Vals);
+
+    unsigned NumArgOperands = FuncletPad.arg_size();
+    Vals.push_back(NumArgOperands);
+    for (unsigned Op = 0; Op != NumArgOperands; ++Op)
+      pushValueAndType(FuncletPad.getArgOperand(Op), InstID, Vals);
+    break;
+  }
+  case Instruction::CatchSwitch: {
+    Code = bitc::FUNC_CODE_INST_CATCHSWITCH;
+    const auto &CatchSwitch = cast<CatchSwitchInst>(I);
+
+    pushValue(CatchSwitch.getParentPad(), InstID, Vals);
+
+    unsigned NumHandlers = CatchSwitch.getNumHandlers();
+    Vals.push_back(NumHandlers);
+    for (const BasicBlock *CatchPadBB : CatchSwitch.handlers())
+      Vals.push_back(VE.getValueID(CatchPadBB));
+
+    if (CatchSwitch.hasUnwindDest())
+      Vals.push_back(VE.getValueID(CatchSwitch.getUnwindDest()));
+    break;
+  }
+  case Instruction::CallBr: {
+    const CallBrInst *CBI = cast<CallBrInst>(&I);
+    const Value *Callee = CBI->getCalledOperand();
+    FunctionType *FTy = CBI->getFunctionType();
+
+    if (CBI->hasOperandBundles())
+      writeOperandBundles(*CBI, InstID);
+
+    Code = bitc::FUNC_CODE_INST_CALLBR;
+
+    Vals.push_back(VE.getAttributeListID(CBI->getAttributes()));
+
+    Vals.push_back(CBI->getCallingConv() << bitc::CALL_CCONV |
+                   1 << bitc::CALL_EXPLICIT_TYPE);
+
+    Vals.push_back(VE.getValueID(CBI->getDefaultDest()));
+    Vals.push_back(CBI->getNumIndirectDests());
+    for (unsigned i = 0, e = CBI->getNumIndirectDests(); i != e; ++i)
+      Vals.push_back(VE.getValueID(CBI->getIndirectDest(i)));
+
+    Vals.push_back(VE.getTypeID(FTy));
+    pushValueAndType(Callee, InstID, Vals);
+
+    // Emit value #'s for the fixed parameters.
+    for (unsigned i = 0, e = FTy->getNumParams(); i != e; ++i)
+      pushValue(I.getOperand(i), InstID, Vals); // fixed param.
+
+    // Emit type/value pairs for varargs params.
+    if (FTy->isVarArg()) {
+      for (unsigned i = FTy->getNumParams(), e = CBI->arg_size(); i != e; ++i)
+        pushValueAndType(I.getOperand(i), InstID, Vals); // vararg
+    }
+    break;
+  }
+  case Instruction::Unreachable:
+    Code = bitc::FUNC_CODE_INST_UNREACHABLE;
+    AbbrevToUse = FUNCTION_INST_UNREACHABLE_ABBREV;
+    break;
+
+  case Instruction::PHI: {
+    const PHINode &PN = cast<PHINode>(I);
+    Code = bitc::FUNC_CODE_INST_PHI;
+    // With the newer instruction encoding, forward references could give
+    // negative valued IDs.  This is most common for PHIs, so we use
+    // signed VBRs.
+    SmallVector<uint64_t, 128> Vals64;
+    // Use NonOpaqueTypeMap for PHI type if available
+    Type *PHIType = PN.getType();
+    if (NonOpaqueTypeMap && NonOpaqueTypeMap->count(&I)) {
+      PHIType = (*NonOpaqueTypeMap)[&I];
+    }
+    Vals64.push_back(VE.getTypeID(PHIType));
+    for (unsigned i = 0, e = PN.getNumIncomingValues(); i != e; ++i) {
+      pushValueSigned(PN.getIncomingValue(i), InstID, Vals64);
+      Vals64.push_back(VE.getValueID(PN.getIncomingBlock(i)));
+    }
+
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0)
+      Vals64.push_back(Flags);
+
+    // Emit a Vals64 vector and exit.
+    Stream.EmitRecord(Code, Vals64, AbbrevToUse);
+    Vals64.clear();
+    return;
+  }
+
+  case Instruction::LandingPad: {
+    const LandingPadInst &LP = cast<LandingPadInst>(I);
+    Code = bitc::FUNC_CODE_INST_LANDINGPAD;
+    // Use NonOpaqueTypeMap for landing pad type if available
+    Type *LPType = LP.getType();
+    if (NonOpaqueTypeMap && NonOpaqueTypeMap->count(&I)) {
+      LPType = (*NonOpaqueTypeMap)[&I];
+    }
+    Vals.push_back(VE.getTypeID(LPType));
+    Vals.push_back(LP.isCleanup());
+    Vals.push_back(LP.getNumClauses());
+    for (unsigned I = 0, E = LP.getNumClauses(); I != E; ++I) {
+      if (LP.isCatch(I))
+        Vals.push_back(LandingPadInst::Catch);
+      else
+        Vals.push_back(LandingPadInst::Filter);
+      pushValueAndType(LP.getClause(I), InstID, Vals);
+    }
+    break;
+  }
+
+  case Instruction::Alloca: {
+    Code = bitc::FUNC_CODE_INST_ALLOCA;
+    const AllocaInst &AI = cast<AllocaInst>(I);
+    Vals.push_back(VE.getTypeID(AI.getAllocatedType()));
+    Vals.push_back(VE.getTypeID(I.getOperand(0)->getType()));
+    Vals.push_back(VE.getValueID(I.getOperand(0))); // size.
+    using APV = AllocaPackedValues;
+    unsigned Record = 0;
+    unsigned EncodedAlign = getEncodedAlign(AI.getAlign());
+    Bitfield::set<APV::AlignLower>(
+        Record, EncodedAlign & ((1 << APV::AlignLower::Bits) - 1));
+    Bitfield::set<APV::AlignUpper>(Record,
+                                   EncodedAlign >> APV::AlignLower::Bits);
+    Bitfield::set<APV::UsedWithInAlloca>(Record, AI.isUsedWithInAlloca());
+    Bitfield::set<APV::ExplicitType>(Record, true);
+    Bitfield::set<APV::SwiftError>(Record, AI.isSwiftError());
+    Vals.push_back(Record);
+
+    unsigned AS = AI.getAddressSpace();
+    if (AS != M.getDataLayout().getAllocaAddrSpace())
+      Vals.push_back(AS);
+    break;
+  }
+
+  case Instruction::Load: {
+    if (cast<LoadInst>(I).isAtomic()) {
+      Code = bitc::FUNC_CODE_INST_LOADATOMIC;
+      pushValueAndType(I.getOperand(0), InstID, Vals);
+    } else {
+      Code = bitc::FUNC_CODE_INST_LOAD;
+      if (!pushValueAndType(I.getOperand(0), InstID, Vals)) // ptr
+        AbbrevToUse = FUNCTION_INST_LOAD_ABBREV;
+    }
+    // Use NonOpaqueTypeMap for loaded type if available
+    Type *LoadedType = I.getType();
+    if (NonOpaqueTypeMap && NonOpaqueTypeMap->count(&I)) {
+      LoadedType = (*NonOpaqueTypeMap)[&I];
+    }
+    Vals.push_back(VE.getTypeID(LoadedType));
+    Vals.push_back(getEncodedAlign(cast<LoadInst>(I).getAlign()));
+    Vals.push_back(cast<LoadInst>(I).isVolatile());
+    if (cast<LoadInst>(I).isAtomic()) {
+      Vals.push_back(getEncodedOrdering(cast<LoadInst>(I).getOrdering()));
+      Vals.push_back(getEncodedSyncScopeID(cast<LoadInst>(I).getSyncScopeID()));
+    }
+    break;
+  }
+  case Instruction::Store: {
+    if (cast<StoreInst>(I).isAtomic()) {
+      Code = bitc::FUNC_CODE_INST_STOREATOMIC;
+    } else {
+      Code = bitc::FUNC_CODE_INST_STORE;
+      AbbrevToUse = FUNCTION_INST_STORE_ABBREV;
+    }
+    if (pushValueAndType(I.getOperand(1), InstID, Vals)) // ptrty + ptr
+      AbbrevToUse = 0;
+    if (pushValueAndType(I.getOperand(0), InstID, Vals)) // valty + val
+      AbbrevToUse = 0;
+    Vals.push_back(getEncodedAlign(cast<StoreInst>(I).getAlign()));
+    Vals.push_back(cast<StoreInst>(I).isVolatile());
+    if (cast<StoreInst>(I).isAtomic()) {
+      Vals.push_back(getEncodedOrdering(cast<StoreInst>(I).getOrdering()));
+      Vals.push_back(
+          getEncodedSyncScopeID(cast<StoreInst>(I).getSyncScopeID()));
+    }
+    break;
+  }
+  case Instruction::AtomicCmpXchg: {
+    Code = bitc::FUNC_CODE_INST_CMPXCHG;
+    pushValueAndType(I.getOperand(0), InstID, Vals); // ptrty + ptr
+    pushValueAndType(I.getOperand(1), InstID, Vals); // cmp.
+    pushValue(I.getOperand(2), InstID, Vals);        // newval.
+    Vals.push_back(cast<AtomicCmpXchgInst>(I).isVolatile());
+    Vals.push_back(
+        getEncodedOrdering(cast<AtomicCmpXchgInst>(I).getSuccessOrdering()));
+    Vals.push_back(
+        getEncodedSyncScopeID(cast<AtomicCmpXchgInst>(I).getSyncScopeID()));
+    Vals.push_back(
+        getEncodedOrdering(cast<AtomicCmpXchgInst>(I).getFailureOrdering()));
+    Vals.push_back(cast<AtomicCmpXchgInst>(I).isWeak());
+    Vals.push_back(getEncodedAlign(cast<AtomicCmpXchgInst>(I).getAlign()));
+    break;
+  }
+  case Instruction::AtomicRMW: {
+    Code = bitc::FUNC_CODE_INST_ATOMICRMW;
+    pushValueAndType(I.getOperand(0), InstID, Vals); // ptrty + ptr
+    pushValueAndType(I.getOperand(1), InstID, Vals); // valty + val
+    Vals.push_back(
+        getEncodedRMWOperation(cast<AtomicRMWInst>(I).getOperation()));
+    Vals.push_back(cast<AtomicRMWInst>(I).isVolatile());
+    Vals.push_back(getEncodedOrdering(cast<AtomicRMWInst>(I).getOrdering()));
+    Vals.push_back(
+        getEncodedSyncScopeID(cast<AtomicRMWInst>(I).getSyncScopeID()));
+    Vals.push_back(getEncodedAlign(cast<AtomicRMWInst>(I).getAlign()));
+    break;
+  }
+  case Instruction::Fence: {
+    Code = bitc::FUNC_CODE_INST_FENCE;
+    const FenceInst &FI = cast<FenceInst>(I);
+    Vals.push_back(getEncodedOrdering(FI.getOrdering()));
+    Vals.push_back(getEncodedSyncScopeID(FI.getSyncScopeID()));
+    break;
+  }
+  case Instruction::Call: {
+    const CallInst &CI = cast<CallInst>(I);
+    FunctionType *FTy = CI.getFunctionType();
+
+    if (CI.hasOperandBundles())
+      writeOperandBundles(CI, InstID);
+
+    Code = bitc::FUNC_CODE_INST_CALL;
+
+    Vals.push_back(VE.getAttributeListID(CI.getAttributes()));
+
+    unsigned Flags = getOptimizationFlags(&I);
+    Vals.push_back(CI.getCallingConv() << bitc::CALL_CCONV |
+                   unsigned(CI.isTailCall()) << bitc::CALL_TAIL |
+                   unsigned(CI.isMustTailCall()) << bitc::CALL_MUSTTAIL |
+                   1 << bitc::CALL_EXPLICIT_TYPE |
+                   unsigned(CI.isNoTailCall()) << bitc::CALL_NOTAIL |
+                   unsigned(Flags != 0) << bitc::CALL_FMF);
+    if (Flags != 0)
+      Vals.push_back(Flags);
+
+    Vals.push_back(VE.getTypeID(FTy));
+    pushValueAndType(CI.getCalledOperand(), InstID, Vals); // Callee
+
+    // Emit value #'s for the fixed parameters.
+    for (unsigned i = 0, e = FTy->getNumParams(); i != e; ++i)
+      pushValue(CI.getArgOperand(i), InstID, Vals); // fixed param.
+
+    // Emit type/value pairs for varargs params.
+    if (FTy->isVarArg()) {
+      for (unsigned i = FTy->getNumParams(), e = CI.arg_size(); i != e; ++i)
+        pushValueAndType(CI.getArgOperand(i), InstID, Vals); // varargs
+    }
+    break;
+  }
+  case Instruction::VAArg: {
+    Code = bitc::FUNC_CODE_INST_VAARG;
+    Vals.push_back(VE.getTypeID(I.getOperand(0)->getType()));   // valistty
+    pushValue(I.getOperand(0), InstID, Vals);                   // valist.
+    // Use NonOpaqueTypeMap for VAArg type if available
+    Type *VAArgType = I.getType();
+    if (NonOpaqueTypeMap && NonOpaqueTypeMap->count(&I)) {
+      VAArgType = (*NonOpaqueTypeMap)[&I];
+    }
+    Vals.push_back(VE.getTypeID(VAArgType)); // restype.
+    break;
+  }
+  case Instruction::Freeze: {
+    Code = bitc::FUNC_CODE_INST_FREEZE;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    break;
+  }
+  }
+
+  Stream.EmitRecord(Code, Vals, AbbrevToUse);
+  Vals.clear();
+}
+
 
 void NonOpaqueTypeModuleWriter::write() {
   writeIdentificationBlock(Stream);
@@ -6040,7 +6543,8 @@ void BitcodeWriter::writeBitcodeWithNonOpaqueTypes(const Module &M,
   assert(M.isMaterialized());
   Mods.push_back(const_cast<Module *>(&M));
   NonOpaqueTypeModuleWriter NonOpaqueTypeModuleWriter(M, StrtabBuilder, *Stream,
-                                          *Index, *ModHash, NonOpaqueTypeMap);
+                                          ShouldPreserveUseListOrder, *Index, 
+                                          GenerateHash, *ModHash, NonOpaqueTypeMap);
   NonOpaqueTypeModuleWriter.write();
 }
 
