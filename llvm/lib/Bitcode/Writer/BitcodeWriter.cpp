@@ -56,6 +56,7 @@
 #include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/TypedPointerType.h"
 #include "llvm/IR/UseListOrder.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueSymbolTable.h"
@@ -315,7 +316,7 @@ public:
   /// Emit the current module to the bitstream.
   void write();
 
-private:
+protected:
   uint64_t bitcodeStartBit() { return BitcodeStartBit; }
 
   size_t addToStrtab(StringRef Str);
@@ -5577,12 +5578,14 @@ class NonOpaqueTypeModuleWriter : public ModuleBitcodeWriter {
   public:
     NonOpaqueTypeModuleWriter(const Module &M, StringTableBuilder &StrtabBuilder,
                         BitstreamWriter &Stream,
+                        bool ShouldPreserveUseListOrder,
                         const ModuleSummaryIndex &Index,
+                        bool GenerateHash,
                         const ModuleHash &ModHash,
                         DenseMap<const Value *, Type *> *NonOpaqueTypeMap)
       : ModuleBitcodeWriter(M, StrtabBuilder, Stream,
                             ShouldPreserveUseListOrder, &Index,
-                            GenerateHash, ModHash),
+                            GenerateHash, const_cast<ModuleHash*>(&ModHash)),
         NonOpaqueTypeMap(NonOpaqueTypeMap) {}
 
   void write();
@@ -5593,7 +5596,7 @@ class NonOpaqueTypeModuleWriter : public ModuleBitcodeWriter {
   DenseMap<const Value *, Type *> *NonOpaqueTypeMap;
   void writeTypeTable();
   void writeFunction(const Function &F, DenseMap<const Function *, uint64_t> &FunctionToBitcodeIndex);
-  void writeInstruction(const Instruction &I, DenseMap<const Function *, uint64_t> &FunctionToBitcodeIndex);
+  void writeInstruction(const Instruction &I, unsigned InstID, SmallVectorImpl<unsigned> &Vals);
 };
 
 
@@ -5698,6 +5701,7 @@ void NonOpaqueTypeModuleWriter::writeTypeTable() {
       // opaque pointers are unsupported, so emit using an opaque element type
       auto ET = StructType::get(PTy->getContext());
       TypeVals.push_back(VE.getTypeID(ET));
+      unsigned AddressSpace = PTy->getAddressSpace();
       TypeVals.push_back(AddressSpace);
       if (AddressSpace == 0)
         AbbrevToUse = PtrAbbrev;
