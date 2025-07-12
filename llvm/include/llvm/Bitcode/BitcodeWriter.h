@@ -23,7 +23,7 @@
 #include <memory>
 #include <string>
 #include <vector>
-
+#include "llvm/ADT/DenseMap.h"
 namespace llvm {
 
 class BitstreamWriter;
@@ -109,6 +109,16 @@ public:
              const ModuleToSummariesForIndexTy *ModuleToSummariesForIndex,
              const GVSummaryPtrSet *DecSummaries);
 };
+
+
+
+LLVM_ABI void writeBitcodeWithNonOpaqueTypes(const Module &M,
+  bool ShouldPreserveUseListOrder = false,
+  const ModuleSummaryIndex *Index = nullptr,
+  bool GenerateHash = false,
+  ModuleHash *ModHash = nullptr,
+  bool WriteNonOpaqueTypes = true,
+  DenseMap<const Value *, Type *> *NonOpaqueTypeMap = nullptr);
 
 /// Write the specified module to the specified raw output stream.
 ///
