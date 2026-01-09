@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "llvm/ADT/DenseMap.h"
 
 namespace llvm {
 
@@ -92,6 +93,18 @@ public:
                             const ModuleSummaryIndex *Index = nullptr,
                             bool GenerateHash = false,
                             ModuleHash *ModHash = nullptr);
+
+
+
+//This is for Writing Backword Compatible Bitcode with Non-Opaque types
+
+LLVM_ABI void writeBitcodeWithNonOpaqueTypes(const Module &M,
+                                             bool ShouldPreserveUseListOrder = false,
+                                             const ModuleSummaryIndex *Index = nullptr,
+                                             bool GenerateHash = false,
+                                             ModuleHash *ModHash = nullptr,
+                                             bool WriteNonOpaqueTypes = true,
+                                             DenseMap<const Value *, Type *> *NonOpaqueTypeMap = nullptr);
 
   /// Write the specified thin link bitcode file (i.e., the minimized bitcode
   /// file) to the buffer specified at construction time. The thin link
